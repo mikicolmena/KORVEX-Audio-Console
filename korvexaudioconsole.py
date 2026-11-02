@@ -21,6 +21,15 @@ from PyQt6.QtGui import QColor, QPainter, QLinearGradient, QBrush, QIcon
 def log(tag: str, msg: str):
     print(f"[Korvex/{tag}] {msg}", flush=True)
 
+_logged_once: set = set()
+def log_once(tag: str, msg: str):
+    """Igual que log(), pero cada mensaje distinto solo se imprime una vez
+    (para errores dentro del bucle de sondeo que se repetirían cada 250 ms)."""
+    key = f"{tag}|{msg}"
+    if key in _logged_once: return
+    _logged_once.add(key)
+    log(tag, msg)
+
 # ======================================================================
 # ESTILO
 # ======================================================================
@@ -117,10 +126,10 @@ def _find_logo_path() -> Optional[str]:
     candidates = [
         os.path.join(os.path.dirname(os.path.abspath(__file__)), "KorvexLogo.png"),
         os.path.join(os.path.dirname(os.path.abspath(__file__)), "KorvexLogo.ico"),
-        "/usr/share/icons/hicolor/256x256/apps/korvex-streamdeck.png",
-        "/usr/share/icons/hicolor/128x128/apps/korvex-streamdeck.png",
-        "/usr/share/pixmaps/korvex-streamdeck.png",
-        os.path.expanduser("~/.local/share/icons/korvex-streamdeck.png"),
+        "/usr/share/icons/hicolor/256x256/apps/korvex-audio-console.png",
+        "/usr/share/icons/hicolor/128x128/apps/korvex-audio-console.png",
+        "/usr/share/pixmaps/korvex-audio-console.png",
+        os.path.expanduser("~/.local/share/icons/korvex-audio-console.png"),
     ]
     for p in candidates:
         if os.path.exists(p):
@@ -137,7 +146,7 @@ def _get_app_icon() -> QIcon:
 # AUTOSTART
 # ======================================================================
 def _autostart_path() -> str:
-    return os.path.expanduser("~/.config/autostart/korvex-streamdeck.desktop")
+    return os.path.expanduser("~/.config/autostart/korvex-audio-console.desktop")
 
 def is_autostart_enabled() -> bool:
     return os.path.exists(_autostart_path())
@@ -147,14 +156,20 @@ def enable_autostart() -> bool:
         path = _autostart_path()
         os.makedirs(os.path.dirname(path), exist_ok=True)
         script = os.path.abspath(sys.argv[0])
-        py = sys.executable or "/usr/bin/env python3"
+        installed = script.startswith("/usr/lib/korvex-audio-console/") and \
+            shutil.which("korvex-audio-console")
+        if installed:
+            exec_line = "korvex-audio-console"
+        else:
+            py = sys.executable or "/usr/bin/env python3"
+            exec_line = f'"{py}" "{script}"'
         with open(path, "w") as f:
             f.write(f"""[Desktop Entry]
 Type=Application
-Name=KORVEX Stream Deck
+Name=KORVEX Audio Console
 Comment=Audio mixer for streaming
-Exec={py} {script}
-Icon=korvex-streamdeck
+Exec={exec_line}
+Icon=korvex-audio-console
 Terminal=false
 Categories=Audio;AudioVideo;
 X-GNOME-Autostart-enabled=true
@@ -164,6 +179,31 @@ StartupNotify=false
     except Exception as e:
         log("ERROR", f"enable_autostart: {e}")
         return False
+
+# ======================================================================
+# MIGRACIÓN DESDE "KORVEX Stream Deck" (nombre anterior de la app)
+# ======================================================================
+LEGACY_ID = "korvex-streamdeck"
+
+def migrate_legacy_install():
+    """Copia la config del nombre antiguo y rehace su autostart. La carpeta
+    antigua se deja intacta (copiar, no mover) por si hay que volver atrás."""
+    old_cfg = os.path.expanduser(f"~/.config/{LEGACY_ID}")
+    new_cfg = os.path.expanduser("~/.config/korvex-audio-console")
+    if os.path.isdir(old_cfg) and not os.path.exists(new_cfg):
+        try:
+            shutil.copytree(old_cfg, new_cfg)
+            log("MIGRATE", f"Config copiada de {old_cfg}")
+        except Exception as e:
+            log("ERROR", f"migrar config: {e}")
+    old_auto = os.path.expanduser(f"~/.config/autostart/{LEGACY_ID}.desktop")
+    if os.path.exists(old_auto):
+        if enable_autostart():
+            try:
+                os.remove(old_auto)
+                log("MIGRATE", "Autostart migrado al nuevo nombre")
+            except Exception as e:
+                log("ERROR", f"borrar autostart antiguo: {e}")
 
 def disable_autostart() -> bool:
     try:
@@ -202,7 +242,15 @@ class AppState:
 def slugify(text: str) -> str:
     text = text.strip().lower()
     text = re.sub(r'[^\w\s-]', '', text, flags=re.UNICODE)
-    return re.sub(r'[-\s]+', '_', text)[:40]
+    return re.sub(r'[-\s]+', '_', text)[:40] or "canal"
+
+def sanitize_channel_name(name: str) -> str:
+    """Hace seguro un nombre visible para los argumentos de módulo de Pulse/PipeWire.
+    Las comillas y barras invertidas rompen `device.description='...'`, así que se
+    sustituyen por sus equivalentes tipográficos (se ven casi igual)."""
+    name = (name or "").strip()
+    name = name.replace("\\", "/").replace("'", "\u2019").replace('"', "\u201d")
+    return re.sub(r"\s+", " ", name)[:60]
 
 def generate_sink_name(base_name: str) -> str:
     return f"korvex_ch_{slugify(base_name)}"
@@ -445,7 +493,8 @@ class AudioWorker(QObject):
                     try:
                         so = self._get_sink_by_name(self._original_default_sink_name)
                         if so: self.pulse.default_set(so)
-                    except Exception: pass
+                    except Exception as e:
+                        log("STOP", f"no se pudo restaurar el sink por defecto: {e}")
                 real_idx = self._get_sink_index(self._original_default_sink_name or "")
                 if real_idx is None:
                     phys = [s for s in self.pulse.sink_list()
@@ -461,8 +510,9 @@ class AudioWorker(QObject):
                             so = self.pulse.sink_info(si.sink)
                             if so.name in our:
                                 self.pulse.sink_input_move(si.index, real_idx)
-                        except Exception: pass
-            except Exception: pass
+                        except Exception: pass   # la app puede haberse cerrado
+            except Exception as e:
+                log("STOP", f"error devolviendo apps a la salida real: {e}")
             finally:
                 self._unload_all_tracked_modules()
                 try: self.pulse.close()
@@ -497,7 +547,8 @@ class AudioWorker(QObject):
         mid = self._module_ids.pop(key, None)
         if mid and self.pulse:
             try: self.pulse.module_unload(mid)
-            except Exception: pass
+            except Exception as e:
+                if not _is_index_error(e): log("ERROR", f"unload {key}: {e}")
 
     def _unload_all_tracked_modules(self):
         for k in list(self._module_ids.keys()): self._unload_module(k)
@@ -519,42 +570,67 @@ class AudioWorker(QObject):
                     args.get("sink", "").startswith(self.CHANNEL_PREFIX)))
                 if is_sink or is_lb:
                     try: self.pulse.module_unload(mod.index)
-                    except Exception: pass
-        except Exception: pass
+                    except Exception as e: log("CLEANUP", f"módulo {mod.index}: {e}")
+        except Exception as e:
+            log("CLEANUP", f"module_list: {e}")
 
     def _get_sink_by_name(self, name):
         if not self.pulse: return None
         try:
             for s in self.pulse.sink_list():
                 if s.name == name: return s
-        except Exception: pass
+        except Exception as e:
+            log_once("ERROR", f"sink_list: {e}")
         return None
 
     def _create_null_sink(self, sink_name: str, description: str):
-        args = f"sink_name={sink_name} sink_properties=device.description='{description}'"
+        description = sanitize_channel_name(description)
+        # Las comillas dobles exteriores hacen falta para que PipeWire no corte el
+        # nombre en el primer espacio ("Mi Canal" acababa como "Mi").
+        args = f"sink_name={sink_name} sink_properties=\"device.description='{description}'\""
         return self._load_module("module-null-sink", args, f"sink:{sink_name}")
+
+    def _track_existing_sink_module(self, sink_name: str):
+        try:
+            for mod in self.pulse.module_list():
+                if mod.name == "module-null-sink" and \
+                   parse_module_args(mod.argument).get("sink_name") == sink_name:
+                    self._module_ids[f"sink:{sink_name}"] = mod.index
+                    return
+        except Exception as e:
+            log("ERROR", f"module_list ({sink_name}): {e}")
+
+    def _migrate_truncated_assignments(self, name: str):
+        """Versiones anteriores creaban el sink con el nombre cortado en el primer
+        espacio, y las asignaciones se guardaban con ese nombre cortado. Se
+        reasignan al nombre completo para no perder el enrutado de las apps."""
+        short = name.split(" ")[0]
+        if short == name: return
+        if any(c.get("name") == short for c in self.config.get("channels", [])): return
+        for b, c in self.config.get("assignments", {}).items():
+            if c == short: self.config["assignments"][b] = name
 
     def _ensure_audio_graph(self):
         if not self._sink_exists(self.MASTER_SINK_NAME):
             self._create_null_sink(self.MASTER_SINK_NAME, "KORVEX Master Mix")
         else:
-            for mod in self.pulse.module_list():
-                if mod.name == "module-null-sink" and \
-                   parse_module_args(mod.argument).get("sink_name") == self.MASTER_SINK_NAME:
-                    self._module_ids[f"sink:{self.MASTER_SINK_NAME}"] = mod.index
-                    break
+            self._track_existing_sink_module(self.MASTER_SINK_NAME)
         sys_sink = f"{self.CHANNEL_PREFIX}system"
         if not self._sink_exists(sys_sink):
             self._create_null_sink(sys_sink, self.SYSTEM_CHANNEL_VISIBLE_NAME)
         else:
-            for mod in self.pulse.module_list():
-                if mod.name == "module-null-sink" and \
-                   parse_module_args(mod.argument).get("sink_name") == sys_sink:
-                    self._module_ids[f"sink:{sys_sink}"] = mod.index
-                    break
+            self._track_existing_sink_module(sys_sink)
         for ch_cfg in self.config.get("channels", []):
             name = ch_cfg["name"]
             if name == self.SYSTEM_CHANNEL_VISIBLE_NAME: continue
+            clean = sanitize_channel_name(name)
+            if clean != name:
+                # Nombre antiguo con comillas: se normaliza también en las asignaciones
+                ch_cfg["name"] = clean
+                for b, c in self.config.get("assignments", {}).items():
+                    if c == name: self.config["assignments"][b] = clean
+                name = clean
+            self._migrate_truncated_assignments(name)
             sink_name = ch_cfg.get("sink_name", generate_sink_name(name))
             if not sink_name.startswith(self.CHANNEL_PREFIX):
                 sink_name = generate_sink_name(name)
@@ -562,17 +638,14 @@ class AudioWorker(QObject):
                 mid = self._create_null_sink(sink_name, name)
                 if mid: ch_cfg["sink_name"] = sink_name
             else:
-                for mod in self.pulse.module_list():
-                    if mod.name == "module-null-sink" and \
-                       parse_module_args(mod.argument).get("sink_name") == sink_name:
-                        self._module_ids[f"sink:{sink_name}"] = mod.index
-                        break
+                self._track_existing_sink_module(sink_name)
         self._recreate_channel_loopbacks()
         self._update_output_routing()
         try:
             so = self._get_sink_by_name(sys_sink)
             if so: self.pulse.default_set(so)
-        except Exception: pass
+        except Exception as e:
+            log("ERROR", f"default_set System: {e}")
         for sn in self._get_current_channels_raw().keys():
             self._start_peak_reader(sn)
         self._save_config()
@@ -618,7 +691,8 @@ class AudioWorker(QObject):
                 if s.name == name:
                     self._sink_name_to_index[name] = s.index
                     return s.index
-        except Exception: pass
+        except Exception as e:
+            log_once("ERROR", f"sink_list: {e}")
         return None
 
     def _sink_input_exists(self, si_index) -> bool:
@@ -689,7 +763,9 @@ class AudioWorker(QObject):
                 try:
                     self.pulse.sink_input_move(si_index, idx)
                     moved = True
-                except Exception: pass
+                except Exception as e:
+                    if not _is_index_error(e):
+                        log_once("MOVE", f"{si_index} -> {target_sink_name}: {e}")
         return moved
 
     def _get_current_channels_raw(self):
@@ -726,8 +802,11 @@ class AudioWorker(QObject):
                     self.pulse.sink_input_mute(si.index, mute)
                     self._last_applied_vol[si.index] = volume
                     count += 1
-                except Exception: pass
-        except Exception: pass
+                except Exception as e:
+                    # La app puede haberse cerrado justo ahora: no es un error real
+                    if not _is_index_error(e): log("ERROR", f"vol app {si.index}: {e}")
+        except Exception as e:
+            log("ERROR", f"apply_volume {channel_sink_name}: {e}")
         return count
 
     def _poll_loop(self):
@@ -806,12 +885,12 @@ class AudioWorker(QObject):
             if sink_name not in self._channel_volumes:
                 so = all_sinks_by_name.get(sink_name)
                 if so:
-                    try:
-                        vol = int(self.pulse.sink_volume(so.index).value_flat * 100)
-                        mute = self.pulse.sink_mute(so.index)
-                        self._channel_volumes[sink_name] = vol
-                        self._channel_mutes[sink_name] = mute
-                    except Exception: pass
+                    # OJO: pulse.sink_mute(idx) con un solo argumento MUTEA (mute=True
+                    # por defecto). El estado se lee siempre del objeto sink.
+                    vol = int(round(so.volume.value_flat * 100)) if so.volume else 100
+                    mute = bool(so.mute)
+                    self._channel_volumes[sink_name] = vol
+                    self._channel_mutes[sink_name] = mute
             with self._peak_lock:
                 peak = self._peak_cache.get(sink_name, 0.0)
             if mute or vol == 0: peak = 0.0
@@ -830,11 +909,10 @@ class AudioWorker(QObject):
             binary = si.proplist.get("application.process.binary", "") or \
                      si.proplist.get("application.name", si.name)
             icon_name = si.proplist.get("application.icon_name", "") or ""
-            try:
-                app_vol = int(self.pulse.sink_input_volume(si.index).value_flat * 100)
-                app_mute = self.pulse.sink_input_mute(si.index)
-            except Exception:
-                app_vol, app_mute = 100, False
+            # El estado viene en el propio objeto de sink_input_list(); no llamar a
+            # pulse.sink_input_mute(idx) para "leer": con un argumento MUTEA la app.
+            app_vol = int(round(si.volume.value_flat * 100)) if si.volume else 100
+            app_mute = bool(si.mute)
             state.processes.append(ProcessInfo(
                 index=si.index, name=si.name, binary=binary, icon_name=icon_name,
                 current_channel_sink_name=ch_sink,
@@ -851,7 +929,8 @@ class AudioWorker(QObject):
                             pulsectl.PulseVolumeInfo([target_vol/100.0]*n))
                         self.pulse.sink_input_mute(si.index, target_mute)
                         self._last_applied_vol[si.index] = target_vol
-                    except Exception: pass
+                    except Exception as e:
+                        if not _is_index_error(e): log_once("POLL", f"vol app: {e}")
 
             if binary in assignments:
                 tv = assignments[binary]
@@ -883,8 +962,17 @@ class AudioWorker(QObject):
                    "channel_volumes": {}, "channel_mutes": {}}
         if os.path.exists(fpath):
             try:
-                with open(fpath, "r") as f: default.update(json.load(f))
-            except Exception: pass
+                with open(fpath, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if not isinstance(data, dict): raise ValueError("no es un objeto JSON")
+                default.update(data)
+            except Exception as e:
+                # No machacar la config del usuario: se guarda una copia antes de
+                # seguir con los valores por defecto.
+                backup = f"{fpath}.corrupt-{time.strftime('%Y%m%d-%H%M%S')}"
+                try: shutil.copy2(fpath, backup)
+                except Exception: backup = "(no se pudo copiar)"
+                log("ERROR", f"config.json ilegible ({e}). Copia en {backup}")
         if not any(c.get("name") == self.SYSTEM_CHANNEL_VISIBLE_NAME
                    for c in default.get("channels", [])):
             default.setdefault("channels", []).insert(0,
@@ -908,9 +996,14 @@ class AudioWorker(QObject):
     @pyqtSlot()
     def _flush_config(self):
         if not self._config_dirty: return
+        fpath = os.path.join(self.config_path, "config.json")
+        tmp = fpath + ".tmp"
         try:
-            with open(os.path.join(self.config_path, "config.json"), "w") as f:
-                json.dump(self.config, f, indent=4)
+            # Escritura atómica: si se corta a mitad, config.json sigue intacto
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.config, f, indent=4, ensure_ascii=False)
+                f.flush(); os.fsync(f.fileno())
+            os.replace(tmp, fpath)
             self._config_dirty = False
         except Exception as e:
             log("ERROR", f"config save: {e}")
@@ -948,7 +1041,8 @@ class AudioWorker(QObject):
                 try:
                     self.pulse.sink_volume_set(idx,
                         pulsectl.PulseVolumeInfo([volume/100.0]*n))
-                except Exception: pass
+                except Exception as e:
+                    log("ERROR", f"sink_volume_set {sink_name}: {e}")
         except Exception as e:
             log("ERROR", f"set_volume: {e}")
         finally: self._unlock()
@@ -965,7 +1059,8 @@ class AudioWorker(QObject):
             idx = self._get_sink_index(sink_name)
             if idx is not None:
                 try: self.pulse.sink_mute(idx, new_mute)
-                except Exception: pass
+                except Exception as e:
+                    log("ERROR", f"sink_mute {sink_name}: {e}")
         except Exception as e:
             log("ERROR", f"toggle_mute: {e}")
         finally: self._unlock()
@@ -1000,7 +1095,7 @@ class AudioWorker(QObject):
 
     @pyqtSlot(str)
     def add_channel(self, visible_name):
-        visible_name = (visible_name or "").strip()
+        visible_name = sanitize_channel_name(visible_name)
         if not visible_name:
             self.operation_finished.emit(False, "Nombre vacío"); return
         if not self._check_lock(): return
@@ -1052,7 +1147,9 @@ class AudioWorker(QObject):
                     if si.sink == info["sink_index"]:
                         if self._sink_input_exists(si.index):
                             try: self.pulse.sink_input_move(si.index, sys_idx)
-                            except Exception: pass
+                            except Exception as e:
+                                if not _is_index_error(e):
+                                    log("ERROR", f"mover {si.index} a System: {e}")
             dead_name = info["description"]
             for b, c in list(self.config.get("assignments", {}).items()):
                 if c == dead_name:
@@ -1079,7 +1176,7 @@ class AudioWorker(QObject):
 
     @pyqtSlot(str, str)
     def rename_channel(self, old_sink_name, new_visible_name):
-        new_visible_name = (new_visible_name or "").strip()
+        new_visible_name = sanitize_channel_name(new_visible_name)
         if not new_visible_name:
             self.operation_finished.emit(False, "Nombre vacío"); return
         if not self._check_lock(): return
@@ -1093,8 +1190,7 @@ class AudioWorker(QObject):
                 self.operation_finished.emit(True, "Sin cambios"); return
             if any(i["description"] == new_visible_name for i in raw.values()):
                 raise ValueError("Ya existe un canal con ese nombre")
-            self.pulse.sink_proplist_update(info["sink_index"],
-                {"device.description": new_visible_name})
+            self._recreate_channel_sink(old_sink_name, info["description"], new_visible_name)
             for c in self.config.get("channels", []):
                 if c.get("sink_name") == old_sink_name: c["name"] = new_visible_name
             for b, c in self.config.get("assignments", {}).items():
@@ -1106,6 +1202,58 @@ class AudioWorker(QObject):
             log("ERROR", f"rename_channel: {e}")
             self.operation_finished.emit(False, str(e))
         finally: self._unlock()
+
+    def _recreate_channel_sink(self, sink_name: str, old_desc: str, new_desc: str):
+        """pulsectl no permite cambiar device.description de un sink, así que se
+        recrea el null-sink con el MISMO sink_name (volumen, mute y config siguen
+        valiendo) y se devuelven a él las apps que estaban sonando."""
+        old_idx = self._get_sink_index(sink_name)
+        streams = []
+        if old_idx is not None:
+            for si in self.pulse.sink_input_list():
+                if self._is_our_loopback(si): continue
+                if si.sink == old_idx: streams.append(si.index)
+        if f"sink:{sink_name}" not in self._module_ids:
+            self._track_existing_sink_module(sink_name)
+        self._stop_peak_reader(sink_name)
+        self._unload_module(f"lb:{sink_name}->master")
+        self._unload_module(f"sink:{sink_name}")
+        self._sink_name_to_index.pop(sink_name, None)
+
+        def build(desc):
+            if self._create_null_sink(sink_name, desc) is None: return False
+            lb = self._load_module("module-loopback",
+                f"source={sink_name}.monitor sink={self.MASTER_SINK_NAME} "
+                f"source_dont_move=true sink_dont_move=true", f"lb:{sink_name}->master")
+            return lb is not None
+
+        ok = build(new_desc)
+        if not ok:
+            # Deshacer: volver a dejar el canal como estaba
+            self._unload_module(f"lb:{sink_name}->master")
+            self._unload_module(f"sink:{sink_name}")
+            build(old_desc)
+        self._sink_name_to_index.pop(sink_name, None)
+        for si_idx in streams:
+            if self._move_stream(si_idx, sink_name):
+                self._auto_moved_sis[si_idx] = sink_name
+        self._apply_volume_to_channel_apps(sink_name,
+            self._channel_volumes.get(sink_name, 100),
+            self._channel_mutes.get(sink_name, False))
+        new_idx = self._get_sink_index(sink_name)
+        if new_idx is not None:
+            # El sink nuevo nace al 100 % y sin mute: se le devuelve su estado
+            try:
+                vol = self._channel_volumes.get(sink_name, 100)
+                info = self.pulse.sink_info(new_idx)
+                n = len(info.volume.values) if info.volume and info.volume.values else 2
+                self.pulse.sink_volume_set(new_idx, pulsectl.PulseVolumeInfo([vol/100.0]*n))
+                self.pulse.sink_mute(new_idx, self._channel_mutes.get(sink_name, False))
+            except Exception as e:
+                log("ERROR", f"restaurar vol/mute {sink_name}: {e}")
+        self._start_peak_reader(sink_name)
+        if not ok:
+            raise RuntimeError("No se pudo recrear el canal con el nuevo nombre")
 
     @pyqtSlot(str)
     def set_output_sink(self, sink_name):
@@ -1144,6 +1292,12 @@ class ChannelStrip(QFrame):
         self._dragging = False
         self._last_user_change = 0.0
         self._pending_volume: Optional[int] = None
+        # Agrupa los cambios del fader: como mucho un envío al worker cada 30 ms
+        self._emit_timer = QTimer(self)
+        self._emit_timer.setSingleShot(True)
+        self._emit_timer.setInterval(30)
+        self._emit_timer.timeout.connect(self._flush_volume)
+        self._volume_to_emit: Optional[int] = None
         self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
         self.setMinimumHeight(STRIP_MIN_H)
         self._build_ui(info)
@@ -1230,6 +1384,7 @@ class ChannelStrip(QFrame):
 
     def _on_slider_released(self):
         self._dragging = False; self._last_user_change = time.time()
+        self._flush_volume()
 
     def _on_slider_moved(self, value):
         if value != self._last_volume:
@@ -1237,7 +1392,15 @@ class ChannelStrip(QFrame):
             self._last_user_change = time.time()
             self._pending_volume = value
             self.lbl_vol.setText(f"{value}%")
-            self.volume_changed.emit(self.sink_name, value)
+            self._volume_to_emit = value
+            if not self._emit_timer.isActive():
+                self._emit_timer.start()
+
+    def _flush_volume(self):
+        self._emit_timer.stop()
+        if self._volume_to_emit is not None:
+            v, self._volume_to_emit = self._volume_to_emit, None
+            self.volume_changed.emit(self.sink_name, v)
 
     def _ask_rename(self):
         name, ok = QInputDialog.getText(self, "Renombrar", "Nuevo nombre:",
@@ -1431,6 +1594,7 @@ class ChannelsPage(QWidget):
 # ======================================================================
 class ProcessTable(QTableWidget):
     move_requested = pyqtSignal(int, str)
+    UNROUTED_LABEL = "— Fuera del mezclador —"
 
     def __init__(self):
         super().__init__()
@@ -1509,7 +1673,7 @@ class ProcessTable(QTableWidget):
 
         combo = QComboBox()
         combo.setProperty("si_index", si_index)
-        for sn, name in ch_map.items(): combo.addItem(name, sn)
+        self._fill_combo(combo, ch_map, unrouted=False)
         combo.setMinimumHeight(32); combo.setMaximumHeight(34)
         combo.currentIndexChanged.connect(self._on_combo_changed)
         self.setCellWidget(row, 2, combo)
@@ -1526,17 +1690,28 @@ class ProcessTable(QTableWidget):
 
         combo = self.combos.get(proc.index)
         if combo is not None:
+            # Si la app suena directamente en un dispositivo físico (no en un canal
+            # korvex_ch_*), se muestra así en vez de fingir un canal que no es.
+            unrouted = proc.current_channel_sink_name not in ch_map
             current_keys = [combo.itemData(i) for i in range(combo.count())]
-            new_keys = list(ch_map.keys())
+            new_keys = ([""] if unrouted else []) + list(ch_map.keys())
             if current_keys != new_keys:
-                combo.blockSignals(True); combo.clear()
-                for sn, name in ch_map.items(): combo.addItem(name, sn)
-                combo.blockSignals(False)
-            target = proc.current_channel_sink_name
-            if target not in ch_map: target = combo.currentData()
+                self._fill_combo(combo, ch_map, unrouted)
+            target = "" if unrouted else proc.current_channel_sink_name
             t_idx = combo.findData(target)
             if t_idx >= 0 and t_idx != combo.currentIndex():
                 combo.blockSignals(True); combo.setCurrentIndex(t_idx); combo.blockSignals(False)
+
+    def _fill_combo(self, combo: QComboBox, ch_map, unrouted: bool):
+        combo.blockSignals(True); combo.clear()
+        if unrouted:
+            combo.addItem(self.UNROUTED_LABEL, "")
+            item = combo.model().item(0)
+            if item is not None:
+                item.setEnabled(False)  # no se puede elegir, solo informa
+                item.setForeground(QBrush(QColor(TEXT_MUTED)))
+        for sn, name in ch_map.items(): combo.addItem(name, sn)
+        combo.blockSignals(False)
 
     def _on_combo_changed(self, idx):
         combo = self.sender()
@@ -1620,7 +1795,7 @@ class SettingsPage(QWidget):
         cl = QVBoxLayout(card); cl.setContentsMargins(24, 20, 24, 20); cl.setSpacing(8)
         lbl_title = QLabel("Iniciar con el sistema"); lbl_title.setObjectName("SettingLabel")
         cl.addWidget(lbl_title)
-        lbl_hint = QLabel("Si se activa, KORVEX Stream Deck se lanzará al iniciar sesión "
+        lbl_hint = QLabel("Si se activa, KORVEX Audio Console se lanzará al iniciar sesión "
                           "(crea un .desktop en ~/.config/autostart).")
         lbl_hint.setObjectName("SettingHint"); lbl_hint.setWordWrap(True)
         cl.addWidget(lbl_hint)
@@ -1653,14 +1828,14 @@ class MainWindow(QMainWindow):
     shutdown_requested = pyqtSignal()
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("KORVEX Stream Deck")
+        self.setWindowTitle("KORVEX Audio Console")
         self.resize(1400, 780); self.setMinimumSize(1150, 650)
 
         self._app_icon = _get_app_icon()
         if not self._app_icon.isNull():
             self.setWindowIcon(self._app_icon)
 
-        self.config_dir = os.path.expanduser("~/.config/korvex-streamdeck")
+        self.config_dir = os.path.expanduser("~/.config/korvex-audio-console")
         self.thread = QThread()
         self.worker = AudioWorker(self.config_dir)
         self.worker.moveToThread(self.thread)
@@ -1716,13 +1891,16 @@ def main():
     QApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
     app = QApplication(sys.argv)
-    app.setApplicationName("KORVEX Stream Deck")
+    app.setApplicationName("KORVEX Audio Console")
+    # En Wayland el icono de la barra de tareas sale del .desktop con este nombre
+    app.setDesktopFileName("korvex-audio-console")
 
     icon = _get_app_icon()
     if not icon.isNull():
         app.setWindowIcon(icon)
 
     app.setStyleSheet(STYLESHEET)
+    migrate_legacy_install()
     try:
         with pulsectl.Pulse('korvex-check') as p: p.server_info()
     except Exception as e:

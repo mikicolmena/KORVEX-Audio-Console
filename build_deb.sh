@@ -1,9 +1,9 @@
 #!/bin/bash
-# build_deb.sh — Construye el paquete .deb de KORVEX Stream Deck
+# build_deb.sh — Construye el paquete .deb de KORVEX Audio Console
 set -e
 
-PKG_NAME="korvex-streamdeck"
-PKG_VERSION="1.0.0"
+PKG_NAME="korvex-audio-console"
+PKG_VERSION="1.1.0"
 PKG_ARCH="all"
 BUILD_DIR="$(pwd)/build_deb"
 ROOT="${BUILD_DIR}/${PKG_NAME}_${PKG_VERSION}_${PKG_ARCH}"
@@ -13,8 +13,8 @@ echo "🔨 Construyendo ${PKG_NAME} ${PKG_VERSION}..."
 # =============================================================================
 # Comprobaciones previas
 # =============================================================================
-if [ ! -f korvexstreamdeck.py ]; then
-    echo "❌ Falta korvexstreamdeck.py"
+if [ ! -f korvexaudioconsole.py ]; then
+    echo "❌ Falta korvexaudioconsole.py"
     exit 1
 fi
 
@@ -46,15 +46,15 @@ mkdir -p "${ROOT}/usr/share/doc/${PKG_NAME}"
 # =============================================================================
 # Código Python
 # =============================================================================
-cp korvexstreamdeck.py "${ROOT}/usr/lib/${PKG_NAME}/korvexstreamdeck.py"
-chmod 644 "${ROOT}/usr/lib/${PKG_NAME}/korvexstreamdeck.py"
+cp korvexaudioconsole.py "${ROOT}/usr/lib/${PKG_NAME}/korvexaudioconsole.py"
+chmod 644 "${ROOT}/usr/lib/${PKG_NAME}/korvexaudioconsole.py"
 
 # =============================================================================
 # Launcher
 # =============================================================================
 cat > "${ROOT}/usr/bin/${PKG_NAME}" <<EOF
 #!/bin/bash
-exec python3 /usr/lib/${PKG_NAME}/korvexstreamdeck.py "\$@"
+exec python3 /usr/lib/${PKG_NAME}/korvexaudioconsole.py "\$@"
 EOF
 chmod 755 "${ROOT}/usr/bin/${PKG_NAME}"
 
@@ -64,7 +64,7 @@ chmod 755 "${ROOT}/usr/bin/${PKG_NAME}"
 cat > "${ROOT}/usr/share/applications/${PKG_NAME}.desktop" <<EOF
 [Desktop Entry]
 Type=Application
-Name=KORVEX Stream Deck
+Name=KORVEX Audio Console
 GenericName=Audio Mixer
 Comment=Virtual audio mixer for streaming on PipeWire/PulseAudio
 Exec=${PKG_NAME}
@@ -73,7 +73,7 @@ Terminal=false
 Categories=Audio;AudioVideo;Mixer;
 Keywords=audio;mixer;streaming;pipewire;pulseaudio;
 StartupNotify=true
-StartupWMClass=KORVEX Stream Deck
+StartupWMClass=KORVEX Audio Console
 EOF
 chmod 644 "${ROOT}/usr/share/applications/${PKG_NAME}.desktop"
 
@@ -88,13 +88,16 @@ cp KorvexLogo-128.png "${ROOT}/usr/share/icons/hicolor/128x128/apps/${PKG_NAME}.
 # =============================================================================
 cat > "${ROOT}/usr/share/doc/${PKG_NAME}/copyright" <<'EOF'
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
-Upstream-Name: KORVEX Stream Deck
-Source: https://github.com/TU_USUARIO/KORVEX-Stream-Deck
+Upstream-Name: KORVEX Audio Console
+Source: https://github.com/mikicolmena/KORVEX-Audio-Console
 
 Files: *
-Copyright: 2024 KORVEX
+Copyright: 2026 mikicolmena
 License: MIT
 EOF
+if [ -f LICENSE ]; then
+    { echo; sed 's/^$/./; s/^/ /' LICENSE; } >> "${ROOT}/usr/share/doc/${PKG_NAME}/copyright"
+fi
 chmod 644 "${ROOT}/usr/share/doc/${PKG_NAME}/copyright"
 
 # =============================================================================
@@ -108,13 +111,16 @@ Priority: optional
 Architecture: ${PKG_ARCH}
 Depends: python3 (>= 3.10),
          python3-pyqt6,
+         python3-pulsectl,
          pulseaudio-utils
-Recommends: python3-pulsectl
+Conflicts: korvex-streamdeck
+Replaces: korvex-streamdeck
 Suggests: wireplumber
-Maintainer: KORVEX <tu@email.com>
-Homepage: https://github.com/TU_USUARIO/KORVEX-Stream-Deck
+Maintainer: mikicolmena <macolmena60@gmail.com>
+Homepage: https://github.com/mikicolmena/KORVEX-Audio-Console
 Description: Virtual audio mixer for streaming on Linux
- KORVEX Stream Deck is a modern PyQt6 audio mixer built on top of
+ KORVEX Audio Console (formerly KORVEX Stream Deck) is a modern PyQt6
+ audio mixer built on top of
  PipeWire/PulseAudio. It creates virtual sinks per channel, allows
  assigning applications to channels, provides independent volume
  control and mute per channel, and routes the master output to any
@@ -145,17 +151,9 @@ if command -v update-desktop-database >/dev/null 2>&1; then
     update-desktop-database -q /usr/share/applications 2>/dev/null || true
 fi
 
-# Instalar pulsectl si no está
-if ! python3 -c "import pulsectl" 2>/dev/null; then
-    echo "KORVEX: instalando dependencia 'pulsectl' vía pip..."
-    pip3 install --break-system-packages 'pulsectl>=23.5.0,<25.0.0' 2>/dev/null || \
-    pip3 install --user 'pulsectl>=23.5.0,<25.0.0' 2>/dev/null || \
-    echo "KORVEX: AVISO — instala manualmente con: pip3 install --user pulsectl"
-fi
-
 echo ""
-echo "  ✅ KORVEX Stream Deck instalado."
-echo "  Búscalo en el menú como 'KORVEX Stream Deck' o ejecuta: korvex-streamdeck"
+echo "  ✅ KORVEX Audio Console instalado."
+echo "  Búscalo en el menú como 'KORVEX Audio Console' o ejecuta: korvex-audio-console"
 echo ""
 
 exit 0

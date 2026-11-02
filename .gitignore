@@ -1,0 +1,5 @@
+# Artefactos de compilación (el .deb se publica en Releases)
+build_deb/
+*.deb
+__pycache__/
+*.pyc
