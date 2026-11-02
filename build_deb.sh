@@ -173,6 +173,10 @@ chmod 755 "${ROOT}/DEBIAN/prerm"
 # =============================================================================
 # Construir
 # =============================================================================
+# Permisos estándar de Debian: carpetas 755, iconos 644 (no heredar el umask del usuario)
+find "${ROOT}" -type d -exec chmod 755 {} +
+find "${ROOT}/usr/share/icons" -type f -exec chmod 644 {} +
+
 echo "📦 Empaquetando..."
 dpkg-deb --build --root-owner-group "${ROOT}"
 
